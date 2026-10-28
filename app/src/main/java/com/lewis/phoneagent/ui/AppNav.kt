@@ -27,9 +27,13 @@ fun AppNav() {
             ChatScreen(
                 onOpenSettings = { navController.navigate("settings") },
                 onOpenHistory = { navController.navigate("history") },
+                onLaunchGame = { navController.navigate("game") },
                 pendingSessionId = pendingSession,
                 onSessionConsumed = { pendingSession = null },
             )
+        }
+        composable("game") {
+            SnakeGameScreen(onBack = { navController.popBackStack() })
         }
         composable("history") {
             HistoryScreen(
