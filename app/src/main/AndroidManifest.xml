@@ -15,6 +15,8 @@
         android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+    <!-- 错题本复习提醒通知（Android 13+ 运行时申请） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".PhoneAgentApp"
@@ -47,5 +49,10 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- 错题本复习提醒（闹钟到点触发，查到期题数发通知） -->
+        <receiver
+            android:name=".data.remind.ReviewReminderReceiver"
+            android:exported="false" />
     </application>
 </manifest>

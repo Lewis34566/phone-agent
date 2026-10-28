@@ -23,6 +23,7 @@ import com.lewis.phoneagent.tools.ToolResult
 import com.lewis.phoneagent.tools.ToolResultDto
 import com.lewis.phoneagent.tools.toDto
 import com.lewis.phoneagent.util.AppJson
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -63,6 +64,15 @@ class ChatViewModel(
     /** 因权限未授权而暂停的指令：用户授权回来后自动重试 */
     private var pendingText: String? = null
 
+    /** Agent 循环里正在等待用户确认的操作（同一时刻最多一个） */
+    private var pendingApproval: PendingApproval? = null
+
+    private data class PendingApproval(
+        val actionId: String,
+        val messageId: Long,
+        val deferred: CompletableDeferred<Boolean>,
+    )
+
     init {
         viewModelScope.launch {
             _messages.value = historyDao.recent(_currentSession.value, 200).asReversed()
@@ -94,7 +104,7 @@ class ChatViewModel(
     }
 
     /**
-     * 拍照完成：图片消息入聊天 → 自动本地 OCR 识字。
+     * 拍照完成：图片消息入聊天 → 自动本地 OCR 识字 → 识别成功自动存入错题本。
      * OCR 失败（如首次模型未下载）时明确提示，不静默失败。
      */
     fun onImageCaptured(imagePath: String) {
@@ -103,17 +113,25 @@ class ChatViewModel(
         viewModelScope.launch {
             val placeholder = ChatMessage(
                 sessionId = _currentSession.value,
-                role = Role.ASSISTANT, contentType = ContentType.TEXT, content = "识别图片中…",
+                role = Role.ASSISTANT, contentType = ContentType.TEXT, content = "Recognizing text…",
             )
             val placeholderId = historyDao.insert(placeholder)
             _messages.update { it + placeholder.copy(id = placeholderId) }
             val text = try {
                 ocrEngine.recognize(imagePath)
             } catch (e: Exception) {
-                "识字失败：${e.message ?: e.javaClass.simpleName}。" +
-                    "首次识别需要联网下载离线模型（约20MB），请检查网络后重试。"
+                "OCR failed: ${e.message ?: e.javaClass.simpleName}. " +
+                    "First recognition downloads the offline model (~20MB); check the network and retry."
             }
             rewrite(placeholderId, ContentType.TEXT, text)
+
+            // 识别成功 → 自动走 Agent 循环存入错题本（识别失败/空白只显示文字，不误存）
+            val recognized = text.isNotBlank() &&
+                !text.startsWith("OCR failed") &&
+                text != "（没有识别到文字）"
+            if (recognized) {
+                send("把上面拍到的错题存进错题本：学科从内容判断，判断不出就标「未分类」")
+            }
         }
     }
 
@@ -170,17 +188,18 @@ class ChatViewModel(
                     ),
                 )
                 is DispatcherResponse.Text -> append(Role.ASSISTANT, ContentType.TEXT, response.text)
-                is DispatcherResponse.Placeholder -> startLlmFallback(trimmed)
+                is DispatcherResponse.Placeholder -> startAgentTask(trimmed)
             }
         }
     }
 
     /**
-     * LLM 流式兜底：本地未命中时调用。
+     * Agent 循环：本地未命中时调用，LLM 主导直到任务完成。
      * 先插入一条空的助手消息占位，然后按事件流式更新它：
-     * Delta 增量渲染 → FinalText/Error 定稿 → ToolCall 改写为确认卡片。
+     * Delta 增量渲染（跨轮累积，含工具执行进度行）→ FinalText/Error 定稿；
+     * 模型要执行危险操作时出确认卡片，等用户点确认/取消后循环继续。
      */
-    private suspend fun startLlmFallback(text: String) {
+    private suspend fun startAgentTask(text: String) {
         val msg = ChatMessage(
             sessionId = _currentSession.value,
             role = Role.ASSISTANT, contentType = ContentType.TEXT, content = "",
@@ -189,7 +208,7 @@ class ChatViewModel(
         _messages.update { it + msg.copy(id = msgId) } // 用 Room 返回的真实 id，保证 key 唯一
         var buffer = StringBuilder()
 
-        dispatcher.processLlmFallback(
+        dispatcher.processAgent(
             text = text,
             history = _messages.value.filter { it.id != msgId },
             onEvent = { event ->
@@ -201,31 +220,48 @@ class ChatViewModel(
                     is LlmStreamEvent.FinalText -> {
                         rewrite(msgId, ContentType.TEXT, event.text.ifBlank { "（模型没有返回内容）" })
                     }
-                    is LlmStreamEvent.ToolCall -> rewrite(
-                        msgId, ContentType.CONFIRM,
-                        AppJson.json.encodeToString(
-                            ConfirmPayload.serializer(),
-                            ConfirmPayload(event.actionId, event.title, event.description),
-                        ),
-                    )
                     is LlmStreamEvent.Error -> {
                         val finalText = if (buffer.isEmpty()) event.message else buffer.toString()
                         rewrite(msgId, ContentType.TEXT, finalText)
                     }
+                    // ToolCall 不走这里：确认交互在 approve 回调里处理
+                    is LlmStreamEvent.ToolCall -> Unit
                 }
+            },
+            approve = { toolCall ->
+                // 危险操作：消息改写为确认卡片，循环挂起等用户点确认/取消
+                val deferred = CompletableDeferred<Boolean>()
+                pendingApproval = PendingApproval(toolCall.actionId, msgId, deferred)
+                rewrite(
+                    msgId, ContentType.CONFIRM,
+                    AppJson.json.encodeToString(
+                        ConfirmPayload.serializer(),
+                        ConfirmPayload(toolCall.actionId, toolCall.title, toolCall.description),
+                    ),
+                )
+                deferred.await()
             },
         )
     }
 
-    /** 流式渲染中：只更新内存（不频繁写库），定稿时才写库 */
+    /** 流式渲染中：只更新内存（不频繁写库），定稿时才写库。
+     *  确认卡片被确认后循环继续输出，消息要从卡片形态变回文本形态 */
     private fun updateContentInMemory(id: Long, content: String) {
         _messages.update { list ->
-            list.map { if (it.id == id) it.copy(content = content) else it }
+            list.map {
+                if (it.id == id) it.copy(contentType = ContentType.TEXT, content = content) else it
+            }
         }
     }
 
-    /** 确认卡片 → 确认执行 */
+    /** 确认卡片 → 确认执行。Agent 循环里的确认唤醒循环继续；本地快速通道走旧路径 */
     fun confirm(messageId: Long, actionId: String) {
+        val approval = pendingApproval
+        if (approval != null && approval.actionId == actionId) {
+            pendingApproval = null
+            approval.deferred.complete(true)
+            return
+        }
         viewModelScope.launch {
             val response = dispatcher.confirm(actionId)
             when (response) {
@@ -242,8 +278,14 @@ class ChatViewModel(
         }
     }
 
-    /** 确认卡片 → 取消 */
+    /** 确认卡片 → 取消。Agent 循环里的取消告知循环跳过该操作 */
     fun cancel(messageId: Long, actionId: String) {
+        val approval = pendingApproval
+        if (approval != null && approval.actionId == actionId) {
+            pendingApproval = null
+            approval.deferred.complete(false)
+            return
+        }
         dispatcher.cancel(actionId)
         viewModelScope.launch { rewrite(messageId, ContentType.TEXT, "❌ 已取消") }
     }

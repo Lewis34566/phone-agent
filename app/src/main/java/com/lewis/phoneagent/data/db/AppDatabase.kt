@@ -13,11 +13,14 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import com.lewis.phoneagent.model.ChatMessage
 
 /**
- * Room 数据库：操作历史（按会话分组）+ 用户自定义规则 + 全局记忆。
+ * Room 数据库：操作历史（按会话分组）+ 用户自定义规则 + 全局记忆 + 错题本。
  */
 @Database(
-    entities = [ChatMessage::class, UserRuleEntity::class, MemoryEntity::class, NoteEntity::class],
-    version = 3,
+    entities = [
+        ChatMessage::class, UserRuleEntity::class, MemoryEntity::class,
+        NoteEntity::class, MistakeNoteEntity::class,
+    ],
+    version = 4,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -26,11 +29,12 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun ruleDao(): RuleDao
     abstract fun memoryDao(): MemoryDao
     abstract fun noteDao(): NoteDao
+    abstract fun mistakeNoteDao(): MistakeNoteDao
 
     companion object {
         fun create(context: Context): AppDatabase =
             Room.databaseBuilder(context, AppDatabase::class.java, "phone_agent.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                 .build()
 
         /** v1 → v2：历史表加会话列；新建记忆表 */
@@ -56,7 +60,66 @@ abstract class AppDatabase : RoomDatabase() {
                 )
             }
         }
+
+        /** v3 → v4：新建错题本表 */
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS mistake_note (" +
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "question TEXT NOT NULL, answer TEXT NOT NULL, subject TEXT NOT NULL, " +
+                        "imagePath TEXT NOT NULL, stage INTEGER NOT NULL, " +
+                        "nextReviewAt INTEGER NOT NULL, wrongCount INTEGER NOT NULL, " +
+                        "createTime INTEGER NOT NULL)",
+                )
+            }
+        }
     }
+}
+
+/** 错题本 DAO：到期查询驱动复习提醒与复习流程 */
+@Dao
+interface MistakeNoteDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(note: MistakeNoteEntity): Long
+
+    /** 到期待复习的题，按到期时间升序 */
+    @Query("SELECT * FROM mistake_note WHERE nextReviewAt <= :now ORDER BY nextReviewAt ASC LIMIT :limit")
+    suspend fun due(now: Long, limit: Int): List<MistakeNoteEntity>
+
+    /** 到期待复习的题数（提醒通知用） */
+    @Query("SELECT COUNT(*) FROM mistake_note WHERE nextReviewAt <= :now")
+    suspend fun dueCount(now: Long): Int
+
+    /** 错题本总数 */
+    @Query("SELECT COUNT(*) FROM mistake_note")
+    suspend fun total(): Int
+
+    /** 关键词搜索（题目/答案/学科都搜） */
+    @Query(
+        "SELECT * FROM mistake_note WHERE question LIKE '%' || :kw || '%' " +
+            "OR answer LIKE '%' || :kw || '%' OR subject LIKE '%' || :kw || '%' " +
+            "ORDER BY createTime DESC LIMIT :limit",
+    )
+    suspend fun search(kw: String, limit: Int): List<MistakeNoteEntity>
+
+    /** 最近存入的题（存完报序号用） */
+    @Query("SELECT * FROM mistake_note ORDER BY createTime DESC LIMIT :limit")
+    suspend fun recent(limit: Int): List<MistakeNoteEntity>
+
+    @Query("SELECT * FROM mistake_note WHERE id = :id")
+    suspend fun byId(id: Long): MistakeNoteEntity?
+
+    /** 复习后更新：阶段、下次复习时间；答错累加 wrongCount */
+    @Query(
+        "UPDATE mistake_note SET stage = :stage, nextReviewAt = :next, " +
+            "wrongCount = wrongCount + :wrongDelta WHERE id = :id",
+    )
+    suspend fun updateReview(id: Long, stage: Int, next: Long, wrongDelta: Int)
+
+    @Query("DELETE FROM mistake_note WHERE id = :id")
+    suspend fun delete(id: Long)
 }
 
 /** 操作历史 DAO（按会话查询） */

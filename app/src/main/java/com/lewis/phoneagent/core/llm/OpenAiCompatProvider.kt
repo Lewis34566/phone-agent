@@ -81,6 +81,28 @@ class OpenAiCompatProvider(
                         add(buildJsonObject {
                             put("role", m.role)
                             put("content", m.content)
+                            // Agent 循环回喂：工具结果带 tool_call_id，assistant 消息带上轮工具调用
+                            m.toolCallId?.let { put("tool_call_id", it) }
+                            if (m.toolCalls.isNotEmpty()) {
+                                put(
+                                    "tool_calls",
+                                    buildJsonArray {
+                                        m.toolCalls.forEach { tc ->
+                                            add(buildJsonObject {
+                                                put("id", tc.id)
+                                                put("type", "function")
+                                                put(
+                                                    "function",
+                                                    buildJsonObject {
+                                                        put("name", tc.name)
+                                                        put("arguments", tc.argsJson)
+                                                    },
+                                                )
+                                            })
+                                        }
+                                    },
+                                )
+                            }
                         })
                     }
                 },
@@ -121,7 +143,8 @@ class OpenAiCompatProvider(
                 ?: throw IOException("空响应体")
 
             val textBuf = StringBuilder()
-            // 多个工具调用按 index 累积（一句话多任务）
+            // 多个工具调用按 index 累积（一句话多任务）；id 是回喂结果的钥匙
+            val toolIds = LinkedHashMap<Int, String>()
             val toolNames = LinkedHashMap<Int, String>()
             val toolArgs = LinkedHashMap<Int, StringBuilder>()
             var finishReason: String? = null
@@ -147,9 +170,10 @@ class OpenAiCompatProvider(
                         onDelta(piece)
                     }
                 }
-                // 工具调用增量 → 按 index 累积名称与参数 JSON
+                // 工具调用增量 → 按 index 累积 id、名称与参数 JSON
                 delta["tool_calls"]?.jsonArray?.forEach { tc ->
                     val idx = tc.jsonObject["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
+                    tc.jsonObject["id"]?.jsonPrimitive?.contentOrNull?.let { toolIds[idx] = it }
                     val fn = tc.jsonObject["function"]?.jsonObject ?: return@forEach
                     fn["name"]?.jsonPrimitive?.contentOrNull?.let { toolNames[idx] = it }
                     fn["arguments"]?.jsonPrimitive?.contentOrNull?.let {
@@ -162,7 +186,11 @@ class OpenAiCompatProvider(
             return when {
                 finishReason == "tool_calls" && toolNames.isNotEmpty() -> {
                     val calls = toolNames.map { (idx, name) ->
-                        LlmResult.ToolCall(name, parseArgs(toolArgs[idx]?.toString() ?: ""))
+                        LlmResult.ToolCall(
+                            id = toolIds[idx] ?: "call_$idx",
+                            toolName = name,
+                            args = parseArgs(toolArgs[idx]?.toString() ?: ""),
+                        )
                     }
                     if (calls.size == 1) calls.first()
                     else LlmResult.MultiToolCall(calls)

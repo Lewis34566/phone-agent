@@ -23,8 +23,24 @@ interface LlmProvider {
     ): LlmResult
 }
 
-/** 一条对话消息（角色 + 内容），与 OpenAI 格式一一对应，转换在 Provider 内部做 */
-data class LlmMessage(val role: String, val content: String)
+/** 一条对话消息（角色 + 内容），与 OpenAI 格式一一对应，转换在 Provider 内部做。
+ *  Agent 循环专用扩展字段：
+ *   - toolCallId：role=tool 时携带，与 assistant 消息里的工具调用一一对应（OpenAI 协议要求）
+ *   - toolCalls：role=assistant 时携带本轮调用的工具清单（结果回喂后模型据此推理下一步）
+ */
+data class LlmMessage(
+    val role: String,
+    val content: String,
+    val toolCallId: String? = null,
+    val toolCalls: List<LlmToolCall> = emptyList(),
+)
+
+/** assistant 消息里的一条工具调用（回喂上下文用） */
+data class LlmToolCall(
+    val id: String,
+    val name: String,
+    val argsJson: String,
+)
 
 /** 工具描述（给模型看的能力清单，由 ToolSpec 按需转换） */
 data class ToolSchema(
@@ -58,10 +74,10 @@ data class ToolSchema(
     }
 }
 
-/** 模型返回结果：文本 / 单个工具调用 / 多步任务（多工具调用按顺序执行） */
+/** 模型返回结果：文本 / 单个工具调用 / 多工具调用（Agent 循环按顺序执行并回喂结果） */
 sealed interface LlmResult {
     data class Text(val content: String) : LlmResult
-    data class ToolCall(val toolName: String, val args: Map<String, Any?>) : LlmResult
+    data class ToolCall(val id: String, val toolName: String, val args: Map<String, Any?>) : LlmResult
     data class MultiToolCall(val calls: List<ToolCall>) : LlmResult
 }
 

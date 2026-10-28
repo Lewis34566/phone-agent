@@ -10,12 +10,14 @@ import com.lewis.phoneagent.core.llm.OpenAiCompatVisionProvider
 import com.lewis.phoneagent.core.llm.VisionConfigStore
 import com.lewis.phoneagent.data.AppRepository
 import com.lewis.phoneagent.data.ImageMemory
+import com.lewis.phoneagent.data.MistakeRepository
 import com.lewis.phoneagent.data.OcrEngine
 import com.lewis.phoneagent.data.PermissionChecker
 import com.lewis.phoneagent.data.UsageRepository
 import com.lewis.phoneagent.data.db.AppDatabase
 import com.lewis.phoneagent.data.db.HistoryDao
 import com.lewis.phoneagent.data.db.MemoryDao
+import com.lewis.phoneagent.data.db.MistakeNoteDao
 import com.lewis.phoneagent.data.db.NoteDao
 import com.lewis.phoneagent.data.db.RuleDao
 import com.lewis.phoneagent.tools.ToolRegistry
@@ -24,6 +26,10 @@ import com.lewis.phoneagent.tools.action.GameTool
 import com.lewis.phoneagent.tools.action.ImageGenTool
 import com.lewis.phoneagent.tools.action.OpenAppTool
 import com.lewis.phoneagent.tools.action.UninstallAppTool
+import com.lewis.phoneagent.tools.notebook.AddMistakeTool
+import com.lewis.phoneagent.tools.notebook.MarkMistakeTool
+import com.lewis.phoneagent.tools.notebook.ReviewMistakesTool
+import com.lewis.phoneagent.tools.notebook.SearchMistakesTool
 import com.lewis.phoneagent.tools.query.AppDetailTool
 import com.lewis.phoneagent.tools.query.AppPermissionsTool
 import com.lewis.phoneagent.tools.query.BackgroundRankTool
@@ -50,6 +56,8 @@ class AppContainer(context: Context) {
     val ruleDao: RuleDao by lazy { database.ruleDao() }
     val memoryDao: MemoryDao by lazy { database.memoryDao() }
     val noteDao: NoteDao by lazy { database.noteDao() }
+    val mistakeNoteDao: MistakeNoteDao by lazy { database.mistakeNoteDao() }
+    val mistakeRepository: MistakeRepository by lazy { MistakeRepository(mistakeNoteDao) }
 
     val sessionStore: SessionStore by lazy { SessionStore(appContext) }
     val memoryRecorder: MemoryRecorder by lazy { MemoryRecorder(memoryDao) }
@@ -79,6 +87,11 @@ class AppContainer(context: Context) {
                 StorageTool(appRepository),
                 // 便签（办公能力，纯本机离线可用）
                 NoteTool(noteDao),
+                // 错题本（v1 核心场景：拍照→OCR→遗忘曲线→提醒复习）
+                AddMistakeTool(mistakeRepository),
+                ReviewMistakesTool(mistakeRepository),
+                MarkMistakeTool(mistakeRepository),
+                SearchMistakesTool(mistakeRepository),
                 // 联网搜索（Phone-Vibe 能力，零配置）
                 SearchTool(),
                 // 应用详情（软件全管理核心查询）

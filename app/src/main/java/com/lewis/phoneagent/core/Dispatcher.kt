@@ -1,26 +1,18 @@
 package com.lewis.phoneagent.core
 
+import com.lewis.phoneagent.core.agent.AgentLoop
 import com.lewis.phoneagent.core.confirm.ConfirmFlow
-import com.lewis.phoneagent.core.llm.LlmMessage
-import com.lewis.phoneagent.core.llm.LlmNotConfiguredException
 import com.lewis.phoneagent.core.llm.LlmProvider
-import com.lewis.phoneagent.core.llm.LlmResult
-import com.lewis.phoneagent.core.llm.ToolSchema
 import com.lewis.phoneagent.model.ChatMessage
-import com.lewis.phoneagent.model.ContentType
-import com.lewis.phoneagent.model.Role
 import com.lewis.phoneagent.tools.Tool
 import com.lewis.phoneagent.tools.ToolRegistry
 import com.lewis.phoneagent.tools.ToolResult
 
 /**
- * 调度层核心：输入文本 → 本地意图识别 → 工具执行；未命中 → LlmProvider 兜底。
- *
- * 流程：
- *   1. 遍历注册表让每个工具自带 match() 打分，取最高分
- *   2. 分数 ≥ 阈值 → needConfirm 工具先出确认卡片【阶段③】；
- *      其余直接执行【阶段②】
- *   3. 全部未命中 → LlmProvider 流式兜底（文本直接显示 / 工具调用→一律确认→执行）【阶段④】
+ * 调度层核心，两条路：
+ *   1. 本地快速通道：常见指令由工具自带 match() 打分命中（离线、<300ms）；
+ *   2. Agent 循环：未命中交给 LLM 主导的多轮工具循环（安全工具自动执行，
+ *      危险工具弹确认卡片，结果回喂、失败重规划——见 [AgentLoop]）。
  */
 class Dispatcher(
     private val registry: ToolRegistry,
@@ -29,19 +21,14 @@ class Dispatcher(
     private val memoryRecorder: MemoryRecorder? = null,
 ) {
 
-    /** 本地规则命中的最低分阈值（0~1），低于此分认为没听懂，走 LLM 兜底 */
+    /** 本地规则命中的最低分阈值（0~1），低于此分认为没听懂，走 Agent 循环 */
     companion object {
         const val MATCH_THRESHOLD = 0.6f
-
-        private const val SYSTEM_PROMPT =
-            "你是安卓手机管家助手。能力包括：列出应用、找长期未用应用、查看应用权限、后台活动排行、" +
-            "存储空间、打开应用、卸载应用、跳转应用设置页、记便签、查便签。" +
-            "用户需求对应某个能力时，输出工具调用（工具名+参数 JSON）；" +
-            "一句话包含多个需求（如'列应用再查存储'）时，一次返回多个工具调用（按顺序）。" +
-            "无法确定时正常用简体中文简短回复，不要编造能力。写作/总结/翻译类请求直接文本回答。"
     }
 
-    /** 处理一条用户输入，返回给 UI 的响应 */
+    private val agentLoop by lazy { AgentLoop(registry) }
+
+    /** 处理一条用户输入，返回给 UI 的响应（本地快速通道） */
     suspend fun process(text: String): DispatcherResponse {
         val best = registry.matchBest(text)
         if (best != null && best.score >= MATCH_THRESHOLD) {
@@ -54,95 +41,33 @@ class Dispatcher(
                 executeTool(tool, best.args)
             }
         }
-        // 本地未命中：交给 ViewModel 走 LLM 流式兜底（processLlmFallback）
+        // 本地未命中：交给 ViewModel 走 Agent 循环（processAgent）
         return DispatcherResponse.Placeholder(text)
     }
 
     /**
-     * LLM 流式兜底：本地全部未命中时调用。
+     * Agent 循环入口：本地未命中时调用，LLM 主导直到任务完成。
      * 事件流：
-     *  - Delta     ：模型输出增量文本（UI 流式渲染）
-     *  - FinalText ：模型最终答复为纯文本
-     *  - ToolCall  ：模型决定调用工具 → 已注册确认流，UI 出确认卡片
-     *  - Error     ：未配置/网络失败/超时（已自动重试 2 次）→ UI 出错误提示
+     *  - Delta     ：模型输出增量文本（UI 流式渲染；跨轮累积，工具执行过程也有进度行）
+     *  - FinalText ：任务完成的最终全文
+     *  - ToolCall  ：模型要执行危险操作 → UI 出确认卡片，approve 回调等用户决定
+     *  - Error     ：未配置/网络失败（已自动重试）→ UI 出错误提示
      */
-    suspend fun processLlmFallback(
+    suspend fun processAgent(
         text: String,
         history: List<ChatMessage>,
         onEvent: suspend (LlmStreamEvent) -> Unit,
+        approve: suspend (LlmStreamEvent.ToolCall) -> Boolean,
     ) {
         val provider = llmProvider
         if (provider == null) {
             onEvent(LlmStreamEvent.Error(
                 "云端模型未配置。去右上角设置页填 baseUrl / apiKey / model（默认 DeepSeek）后，" +
-                    "本地认不出的模糊需求就会交给模型处理。本地指令不受影响。",
+                    "本地认不出的需求就会交给 Lewis 自动完成。本地指令不受影响。",
             ))
             return
         }
-
-        // 提示词裁剪：只发 system 引导 + 最近 4 轮文本 + 当前问题，绝不塞应用列表
-        val messages = buildLlmMessages(text, history)
-        val schemas = registry.all().map {
-            ToolSchema.fromSpec(it.spec.name, it.spec.description, it.spec.params)
-        }
-
-        try {
-            val result = provider.streamChat(messages, schemas) { delta -> onEvent(LlmStreamEvent.Delta(delta)) }
-            when (result) {
-                is LlmResult.Text -> onEvent(LlmStreamEvent.FinalText(result.content))
-                is LlmResult.ToolCall -> registerToolConfirm(listOf(result), onEvent)
-                is LlmResult.MultiToolCall -> registerToolConfirm(result.calls, onEvent)
-            }
-        } catch (e: LlmNotConfiguredException) {
-            onEvent(LlmStreamEvent.Error("云端模型未配置：去设置页填写 baseUrl / apiKey / model。"))
-        } catch (e: Exception) {
-            onEvent(LlmStreamEvent.Error(
-                "云端模型调用失败：${e.message ?: e.javaClass.simpleName}（已重试）。检查网络或设置页配置。",
-            ))
-        }
-    }
-
-    /**
-     * 模型返回的工具调用（单个或多个）→ 注册确认流。
-     * 模型可能误解用户意图，一律先出确认卡片；多步任务合并成一张计划卡。
-     */
-    private suspend fun registerToolConfirm(
-        calls: List<LlmResult.ToolCall>,
-        onEvent: suspend (LlmStreamEvent) -> Unit,
-    ) {
-        val steps = calls.mapNotNull { call ->
-            val tool = registry.byName(call.toolName)
-            if (tool == null) {
-                onEvent(LlmStreamEvent.FinalText("模型想调用未知工具「${call.toolName}」，已忽略。换个说法再试试。"))
-                return@mapNotNull null
-            }
-            com.lewis.phoneagent.core.confirm.ConfirmFlow.Step(tool, call.args)
-        }
-        if (steps.isEmpty()) return
-        val actionId = confirmFlow.register(steps)
-        if (steps.size == 1) {
-            val (title, description) = steps[0].tool.confirmPrompt(steps[0].args)
-            onEvent(LlmStreamEvent.ToolCall(actionId, title, description))
-        } else {
-            val plan = steps.joinToString("\n") { s ->
-                val (t, _) = s.tool.confirmPrompt(s.args)
-                "• $t"
-            }
-            onEvent(LlmStreamEvent.ToolCall(
-                actionId,
-                "执行 ${steps.size} 步任务？",
-                plan + "\n\n每步执行完会汇总结果。",
-            ))
-        }
-    }
-
-    /** 构建 LLM 消息：system + 最近 4 轮 TEXT 历史 + 当前输入（提示词按需裁剪） */
-    private fun buildLlmMessages(text: String, history: List<ChatMessage>): List<LlmMessage> {
-        val recent = history
-            .filter { it.contentType == ContentType.TEXT }
-            .takeLast(4)
-            .map { LlmMessage(if (it.role == Role.USER) "user" else "assistant", it.content) }
-        return listOf(LlmMessage("system", SYSTEM_PROMPT)) + recent + LlmMessage("user", text)
+        agentLoop.run(provider, text, history, memoryRecorder, onEvent, approve)
     }
 
     /** 用户在确认卡片上点「确认执行」；多步任务顺序执行并汇总 */
