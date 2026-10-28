@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">手机管家Agent</string>
+    <string name="chat_hint">用对话管理你的手机，比如：打开微信、看看哪些应用很久没用…</string>
+</resources>

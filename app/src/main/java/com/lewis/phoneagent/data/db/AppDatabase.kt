@@ -1,0 +1,140 @@
+package com.lewis.phoneagent.data.db
+
+import android.content.Context
+import androidx.room.Dao
+import androidx.room.Database
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+import com.lewis.phoneagent.model.ChatMessage
+
+/**
+ * Room 数据库：操作历史（按会话分组）+ 用户自定义规则 + 全局记忆。
+ */
+@Database(
+    entities = [ChatMessage::class, UserRuleEntity::class, MemoryEntity::class, NoteEntity::class],
+    version = 3,
+    exportSchema = false,
+)
+abstract class AppDatabase : RoomDatabase() {
+
+    abstract fun historyDao(): HistoryDao
+    abstract fun ruleDao(): RuleDao
+    abstract fun memoryDao(): MemoryDao
+    abstract fun noteDao(): NoteDao
+
+    companion object {
+        fun create(context: Context): AppDatabase =
+            Room.databaseBuilder(context, AppDatabase::class.java, "phone_agent.db")
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .build()
+
+        /** v1 → v2：历史表加会话列；新建记忆表 */
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE history ADD COLUMN sessionId INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS memory (" +
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "type TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, " +
+                        "count INTEGER NOT NULL, updateTime INTEGER NOT NULL)",
+                )
+            }
+        }
+
+        /** v2 → v3：新建便签表 */
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS note (" +
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "content TEXT NOT NULL, createTime INTEGER NOT NULL)",
+                )
+            }
+        }
+    }
+}
+
+/** 操作历史 DAO（按会话查询） */
+@Dao
+interface HistoryDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(message: ChatMessage): Long
+
+    @Query("UPDATE history SET content = :content, contentType = :contentType WHERE id = :id")
+    suspend fun updateContent(id: Long, content: String, contentType: String)
+
+    /** 指定会话最近 N 条，时间升序 */
+    @Query("SELECT * FROM history WHERE sessionId = :sessionId ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun recent(sessionId: Long, limit: Int): List<ChatMessage>
+
+    /** 所有会话摘要：每会话取最新一条消息（历史记录页用） */
+    @Query(
+        "SELECT * FROM history WHERE id IN " +
+            "(SELECT MAX(id) FROM history GROUP BY sessionId) ORDER BY timestamp DESC",
+    )
+    suspend fun sessionSummaries(): List<ChatMessage>
+
+    /** 删除整个会话 */
+    @Query("DELETE FROM history WHERE sessionId = :sessionId")
+    suspend fun deleteSession(sessionId: Long)
+}
+
+/** 用户自定义规则 */
+@Dao
+interface RuleDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(rule: UserRuleEntity)
+
+    @Query("SELECT * FROM user_rule WHERE enabled = 1")
+    suspend fun enabledRules(): List<UserRuleEntity>
+}
+
+/** 全局记忆 */
+@Dao
+interface MemoryDao {
+
+    /** 相同 (type,key) 记忆累加计数并更新 value */
+    @Query(
+        "UPDATE memory SET count = count + :delta, value = :value, updateTime = :now " +
+            "WHERE type = :type AND key = :key",
+    )
+    suspend fun bump(type: String, key: String, value: String, delta: Int, now: Long): Int
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insert(memory: MemoryEntity): Long
+
+    /** 按使用次数取 top N（快捷指令个性化用） */
+    @Query("SELECT * FROM memory ORDER BY count DESC LIMIT :limit")
+    suspend fun top(limit: Int): List<MemoryEntity>
+
+    /** 全部记忆（设置页展示） */
+    @Query("SELECT * FROM memory ORDER BY updateTime DESC")
+    suspend fun all(): List<MemoryEntity>
+
+    @Query("DELETE FROM memory WHERE id = :id")
+    suspend fun delete(id: Long)
+}
+
+/** 便签 */
+@Dao
+interface NoteDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(note: NoteEntity): Long
+
+    @Query("SELECT * FROM note ORDER BY createTime DESC LIMIT :limit")
+    suspend fun recent(limit: Int): List<NoteEntity>
+
+    @Query("DELETE FROM note WHERE content LIKE '%' || :keyword || '%'")
+    suspend fun deleteByKeyword(keyword: String): Int
+
+    @Query("DELETE FROM note")
+    suspend fun clear()
+}

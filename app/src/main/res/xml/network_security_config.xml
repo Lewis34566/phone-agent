@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  明文 HTTP 白名单（仅这些地址允许 http，其余流量仍强制 HTTPS）：
+  - 127.0.0.1 / localhost：手机本机 Termux 里的 ollama 服务（离线大模型）
+  - 192.168.126.1 / 192.168.248.1：用户电脑的局域网 IP（电脑端 ollama）
+  IP 变化时需要把新 IP 加进来。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">192.168.126.1</domain>
+        <domain includeSubdomains="false">192.168.248.1</domain>
+    </domain-config>
+</network-security-config>

@@ -1,0 +1,15 @@
+# Gradle
+.gradle/
+build/
+
+# 本机配置（SDK 路径）
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# 签名与密钥（任何情况下都不要提交）
+*.jks
+*.keystore
